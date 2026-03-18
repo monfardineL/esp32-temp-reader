@@ -1,0 +1,66 @@
+openapi: 3.0.0
+info:
+  title: Masterbuilt 710 Smoker Monitor API
+  description: >
+    Telemetry sent via MQTT by the ESP32 microcontroller to the RabbitMQ broker.
+    This schema defines the JSON payload published to the 'smoker/temps' topic.
+  version: 1.0.0
+
+components:
+  schemas:
+    ProbeData:
+      type: object
+      description: Individual temperature probe reading.
+      properties:
+        id:
+          type: integer
+          description: Unique identifier for the probe (1 to 4).
+          example: 1
+        t:
+          type: number
+          format: float
+          nullable: true
+          description: >
+            Temperature in degrees Celsius. 
+            Returns null if the probe is disconnected or hardware error occurs.
+          example: 22.5
+      required:
+        - id
+        - t
+
+    SmokerPayload:
+      type: object
+      description: The main telemetry packet sent every 5 seconds.
+      properties:
+        device:
+          type: string
+          description: Unique hardware identifier for the ESP32 unit.
+          example: "smoker-01"
+        data:
+          type: array
+          description: Array containing the status of all 4 available probes.
+          items:
+            $ref: '#/components/schemas/ProbeData'
+          minItems: 4
+          maxItems: 4
+      required:
+        - device
+        - data
+
+paths:
+  /mqtt/smoker/temps:
+    post:
+      summary: Publish Telemetry (MQTT Simulation)
+      description: >
+        Representation of the message payload published to the MQTT broker.
+        While MQTT is a pub/sub protocol, this describes the data structure 
+        traveling through the 'smoker.temps' routing key in RabbitMQ.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmokerPayload'
+      responses:
+        '200':
+          description: Valid payload accepted by the broker.
