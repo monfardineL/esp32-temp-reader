@@ -32,19 +32,16 @@ The application is configured entirely through environment variables.
 
 ## Running with Docker
 
-You can also run this application via Docker. A multi-stage `Dockerfile` is provided that builds a minimal image from scratch.
+You can also run this application via Docker. The image is automatically built and pushed to the GitHub Container Registry.
 
-1. Build the Docker image:
-   ```bash
-   docker build -t esp32-temp-reader .
-   ```
-2. Run the Docker container, passing the required environment variables:
-   ```bash
-   docker run -d -p 8080:8080 \
-     -e RABBITMQ_URL="amqp://user:pass@your-rabbitmq-host:5672/" \
-     -e PORT="8080" \
-     esp32-temp-reader
-   ```
+Run the Docker container using the pre-built image, passing the required environment variables:
+```bash
+docker run -d -p 8080:8080 \
+  -e RABBITMQ_URL="amqp://user:pass@your-rabbitmq-host:5672/" \
+  -e PORT="8080" \
+  ghcr.io/yourusername/esp32-temp-reader:main
+```
+*(Replace `yourusername` with the repository owner).*
 
 ## Development
 
