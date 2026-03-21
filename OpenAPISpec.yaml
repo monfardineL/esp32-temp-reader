@@ -3,8 +3,8 @@ info:
   title: Masterbuilt 710 Smoker Monitor API
   description: >
     Telemetry sent via MQTT by the ESP32 microcontroller to the RabbitMQ broker.
-    This schema defines the JSON payload published to the 'smoker/temps' topic.
-  version: 1.0.0
+    Includes Epoch timestamp generated via internal NTP sync.
+  version: 1.1.0
 
 components:
   schemas:
@@ -21,8 +21,7 @@ components:
           format: float
           nullable: true
           description: >
-            Temperature in degrees Celsius. 
-            Returns null if the probe is disconnected or hardware error occurs.
+            Temperature in degrees Celsius. Returns null if the probe is disconnected.
           example: 22.5
       required:
         - id
@@ -30,12 +29,16 @@ components:
 
     SmokerPayload:
       type: object
-      description: The main telemetry packet sent every 5 seconds.
+      description: The main telemetry packet sent every 30 seconds.
       properties:
         device:
           type: string
           description: Unique hardware identifier for the ESP32 unit.
           example: "smoker-01"
+        ts:
+          type: integer
+          description: Epoch timestamp (UTC) representing exactly when the read occurred.
+          example: 1710345600
         data:
           type: array
           description: Array containing the status of all 4 available probes.
@@ -45,16 +48,14 @@ components:
           maxItems: 4
       required:
         - device
+        - ts
         - data
 
 paths:
   /mqtt/smoker/temps:
     post:
-      summary: Publish Telemetry (MQTT Simulation)
-      description: >
-        Representation of the message payload published to the MQTT broker.
-        While MQTT is a pub/sub protocol, this describes the data structure 
-        traveling through the 'smoker.temps' routing key in RabbitMQ.
+      summary: Publish Telemetry
+      description: Representation of the payload published to the 'smoker/temps' topic.
       requestBody:
         required: true
         content:
