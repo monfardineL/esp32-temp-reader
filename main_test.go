@@ -27,6 +27,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if config.Port != "8080" {
 		t.Errorf("Expected default Port, got %s", config.Port)
 	}
+	if config.DBURL != "postgres://postgres:postgres@localhost:5432/smoker?sslmode=disable" {
+		t.Errorf("Expected default DBURL, got %s", config.DBURL)
+	}
 }
 
 func TestLoadConfigEnvVars(t *testing.T) {
@@ -35,6 +38,7 @@ func TestLoadConfigEnvVars(t *testing.T) {
 	os.Setenv("RABBITMQ_EXCHANGE", "custom_exchange")
 	os.Setenv("RABBITMQ_ROUTING_KEY", "custom.key")
 	os.Setenv("PORT", "9090")
+	os.Setenv("DB_URL", "postgres://user:pass@remote:5432/db?sslmode=require")
 	defer os.Clearenv()
 
 	config := LoadConfig()
@@ -54,11 +58,15 @@ func TestLoadConfigEnvVars(t *testing.T) {
 	if config.Port != "9090" {
 		t.Errorf("Expected overridden Port, got %s", config.Port)
 	}
+	if config.DBURL != "postgres://user:pass@remote:5432/db?sslmode=require" {
+		t.Errorf("Expected overridden DBURL, got %s", config.DBURL)
+	}
 }
 
 func TestSmokerPayloadDecoding(t *testing.T) {
 	jsonPayload := []byte(`{
 		"device": "smoker-01",
+		"ts": 1710345600,
 		"data": [
 			{"id": 1, "t": 22.5},
 			{"id": 2, "t": 23.1},
@@ -75,6 +83,10 @@ func TestSmokerPayloadDecoding(t *testing.T) {
 
 	if payload.Device != "smoker-01" {
 		t.Errorf("Expected device 'smoker-01', got %s", payload.Device)
+	}
+
+	if payload.TS != 1710345600 {
+		t.Errorf("Expected ts 1710345600, got %d", payload.TS)
 	}
 
 	if len(payload.Data) != 4 {

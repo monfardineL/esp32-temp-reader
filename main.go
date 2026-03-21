@@ -1,13 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
+	_ "github.com/lib/pq"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -18,6 +21,7 @@ type Config struct {
 	RabbitMQExchange   string
 	RabbitMQRoutingKey string
 	Port               string
+	DBURL              string
 }
 
 // LoadConfig loads configuration from environment variables
@@ -28,6 +32,7 @@ func LoadConfig() *Config {
 		RabbitMQExchange:   os.Getenv("RABBITMQ_EXCHANGE"),
 		RabbitMQRoutingKey: os.Getenv("RABBITMQ_ROUTING_KEY"),
 		Port:               os.Getenv("PORT"),
+		DBURL:              os.Getenv("DB_URL"),
 	}
 
 	// Set defaults if not provided
@@ -46,6 +51,9 @@ func LoadConfig() *Config {
 	if config.Port == "" {
 		config.Port = "8080"
 	}
+	if config.DBURL == "" {
+		config.DBURL = "postgres://postgres:postgres@localhost:5432/smoker?sslmode=disable"
+	}
 
 	return config
 }
@@ -59,111 +67,158 @@ type ProbeData struct {
 // SmokerPayload represents the main telemetry packet
 type SmokerPayload struct {
 	Device string      `json:"device"`
+	TS     int64       `json:"ts"`
 	Data   []ProbeData `json:"data"`
 }
 
-// Broker manages connected clients and broadcasts messages
-type Broker struct {
-	// Events are pushed to this channel by the main events-gathering routine
-	Notifier chan []byte
-
-	// New client connections
-	newClients chan chan []byte
-
-	// Closed client connections
-	closingClients chan chan []byte
-
-	// Client connections registry
-	clients map[chan []byte]bool
-
-	// Mutex for synchronizing access to clients map
-	mu sync.Mutex
-}
-
-func NewBroker() *Broker {
-	broker := &Broker{
-		Notifier:       make(chan []byte, 1),
-		newClients:     make(chan chan []byte),
-		closingClients: make(chan chan []byte),
-		clients:        make(map[chan []byte]bool),
+func initDB(dbURL string) (*sql.DB, error) {
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		return nil, err
 	}
 
-	// Set it running - listening and broadcasting events
-	go broker.listen()
+	// Test the connection
+	if err = db.Ping(); err != nil {
+		return nil, err
+	}
 
-	return broker
+	// Create table
+	createTableQuery := `
+	CREATE TABLE IF NOT EXISTS smoker_data (
+		time TIMESTAMPTZ NOT NULL,
+		device TEXT NOT NULL,
+		probe1 DOUBLE PRECISION,
+		probe2 DOUBLE PRECISION,
+		probe3 DOUBLE PRECISION,
+		probe4 DOUBLE PRECISION
+	);
+	`
+	if _, err := db.Exec(createTableQuery); err != nil {
+		return nil, fmt.Errorf("failed to create table: %v", err)
+	}
+
+	// Convert to TimescaleDB hypertable if not already
+	hypertableQuery := `
+	SELECT create_hypertable('smoker_data', by_range('time'), if_not_exists => TRUE);
+	`
+	if _, err := db.Exec(hypertableQuery); err != nil {
+		// Log the error but don't fail, in case we're testing without TimescaleDB extension
+		log.Printf("Note: failed to create hypertable (is TimescaleDB installed?): %v", err)
+	}
+
+	return db, nil
 }
 
-func (broker *Broker) listen() {
-	for {
-		select {
-		case s := <-broker.newClients:
-			// A new client has connected.
-			// Register their message channel
-			broker.mu.Lock()
-			broker.clients[s] = true
-			broker.mu.Unlock()
-			log.Printf("Client added. %d registered clients", len(broker.clients))
-		case s := <-broker.closingClients:
-			// A client has detached and we want to stop sending them messages.
-			broker.mu.Lock()
-			delete(broker.clients, s)
-			broker.mu.Unlock()
-			log.Printf("Removed client. %d registered clients", len(broker.clients))
-		case event := <-broker.Notifier:
-			// We got a new event from the outside!
-			// Send event to all connected clients
-			broker.mu.Lock()
-			for clientMessageChan := range broker.clients {
-				select {
-				case clientMessageChan <- event:
-				default:
-					// if we can't send immediately, drop the message for this client
-					log.Printf("Failed to send message to client, dropping it")
-				}
-			}
-			broker.mu.Unlock()
+func insertPayload(db *sql.DB, payload SmokerPayload) error {
+	var p1, p2, p3, p4 *float64
+	for _, p := range payload.Data {
+		switch p.ID {
+		case 1:
+			p1 = p.T
+		case 2:
+			p2 = p.T
+		case 3:
+			p3 = p.T
+		case 4:
+			p4 = p.T
 		}
 	}
+
+	ts := time.Unix(payload.TS, 0)
+	query := `
+		INSERT INTO smoker_data (time, device, probe1, probe2, probe3, probe4)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`
+	_, err := db.Exec(query, ts, payload.Device, p1, p2, p3, p4)
+	return err
 }
 
-func (broker *Broker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Make sure that the writer supports flushing.
-	flusher, ok := rw.(http.Flusher)
-	if !ok {
-		http.Error(rw, "Streaming unsupported!", http.StatusInternalServerError)
-		return
+type CachedDataPoint struct {
+	TS     int64    `json:"ts"`
+	Device string   `json:"device"`
+	Probe1 *float64 `json:"probe1"`
+	Probe2 *float64 `json:"probe2"`
+	Probe3 *float64 `json:"probe3"`
+	Probe4 *float64 `json:"probe4"`
+}
+
+type DataCache struct {
+	sync.RWMutex
+	Points []CachedDataPoint
+}
+
+func NewDataCache() *DataCache {
+	return &DataCache{
+		Points: make([]CachedDataPoint, 0),
 	}
+}
 
-	rw.Header().Set("Content-Type", "text/event-stream")
-	rw.Header().Set("Cache-Control", "no-cache")
-	rw.Header().Set("Connection", "keep-alive")
-	rw.Header().Set("Access-Control-Allow-Origin", "*")
+func (c *DataCache) AddAndEvict(p CachedDataPoint, duration time.Duration) {
+	c.Lock()
+	defer c.Unlock()
 
-	// Each connection registers its own message channel with the Broker's connections registry
-	messageChan := make(chan []byte, 10)
+	c.Points = append(c.Points, p)
 
-	// Signal the broker that we have a new connection
-	broker.newClients <- messageChan
-
-	// Listen to connection close and un-register messageChan
-	notify := req.Context().Done()
-
-	// block waiting for messages broadcast on this connection's messageChan
-	for {
-		select {
-		case <-notify:
-			broker.closingClients <- messageChan
-			return
-		case msg := <-messageChan:
-			// Write to the ResponseWriter
-			// Server Sent Events compatible
-			fmt.Fprintf(rw, "data: %s\n\n", msg)
-
-			// Flush the data immediately instead of buffering it for later.
-			flusher.Flush()
+	// Evict older data
+	cutoff := time.Now().Add(-duration).Unix()
+	var newPoints []CachedDataPoint
+	for _, pt := range c.Points {
+		if pt.TS >= cutoff {
+			newPoints = append(newPoints, pt)
 		}
 	}
+	c.Points = newPoints
+}
+
+func (c *DataCache) GetPoints() []CachedDataPoint {
+	c.RLock()
+	defer c.RUnlock()
+
+	// Return a copy to avoid race conditions
+	cpy := make([]CachedDataPoint, len(c.Points))
+	copy(cpy, c.Points)
+	return cpy
+}
+
+func loadCacheFromDB(db *sql.DB, cache *DataCache, duration time.Duration) error {
+	cutoff := time.Now().Add(-duration)
+
+	query := `
+		SELECT time, device, probe1, probe2, probe3, probe4
+		FROM smoker_data
+		WHERE time >= $1
+		ORDER BY time ASC
+	`
+
+	rows, err := db.Query(query, cutoff)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	cache.Lock()
+	defer cache.Unlock()
+	cache.Points = make([]CachedDataPoint, 0)
+
+	for rows.Next() {
+		var t time.Time
+		var d string
+		var p1, p2, p3, p4 *float64
+		if err := rows.Scan(&t, &d, &p1, &p2, &p3, &p4); err != nil {
+			return err
+		}
+
+		cache.Points = append(cache.Points, CachedDataPoint{
+			TS:     t.Unix(),
+			Device: d,
+			Probe1: p1,
+			Probe2: p2,
+			Probe3: p3,
+			Probe4: p4,
+		})
+	}
+
+	return rows.Err()
 }
 
 const htmlPage = `
@@ -187,7 +242,6 @@ const htmlPage = `
 
     <script>
         const ctx = document.getElementById('tempChart').getContext('2d');
-        const maxDataPoints = 60; // Keep last 60 points
 
         const chart = new Chart(ctx, {
             type: 'line',
@@ -210,39 +264,48 @@ const htmlPage = `
             }
         });
 
-        const evtSource = new EventSource("/events");
-        evtSource.onmessage = function(event) {
-            const payload = JSON.parse(event.data);
-
-            document.getElementById('deviceId').innerText = payload.device;
-
-            const now = new Date();
-            const timeStr = now.getHours().toString().padStart(2, '0') + ':' +
-                            now.getMinutes().toString().padStart(2, '0') + ':' +
-                            now.getSeconds().toString().padStart(2, '0');
-
-            chart.data.labels.push(timeStr);
-            if (chart.data.labels.length > maxDataPoints) {
-                chart.data.labels.shift();
-            }
-
-            payload.data.forEach(probe => {
-                if (probe.id >= 1 && probe.id <= 4) {
-                    const dataset = chart.data.datasets[probe.id - 1];
-                    const temp = probe.t !== null ? probe.t : null;
-                    dataset.data.push(temp);
-                    if (dataset.data.length > maxDataPoints) {
-                        dataset.data.shift();
-                    }
+        async function fetchData() {
+            try {
+                const response = await fetch('/api/temps');
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
                 }
-            });
+                const data = await response.json();
 
-            chart.update();
-        };
+                if (data.length > 0) {
+                    document.getElementById('deviceId').innerText = data[data.length - 1].device;
+                }
 
-        evtSource.onerror = function() {
-            console.error("EventSource failed.");
-        };
+                const labels = [];
+                const d1 = [], d2 = [], d3 = [], d4 = [];
+
+                data.forEach(pt => {
+                    const date = new Date(pt.ts * 1000);
+                    const timeStr = date.getHours().toString().padStart(2, '0') + ':' +
+                                    date.getMinutes().toString().padStart(2, '0') + ':' +
+                                    date.getSeconds().toString().padStart(2, '0');
+                    labels.push(timeStr);
+                    d1.push(pt.probe1);
+                    d2.push(pt.probe2);
+                    d3.push(pt.probe3);
+                    d4.push(pt.probe4);
+                });
+
+                chart.data.labels = labels;
+                chart.data.datasets[0].data = d1;
+                chart.data.datasets[1].data = d2;
+                chart.data.datasets[2].data = d3;
+                chart.data.datasets[3].data = d4;
+
+                chart.update();
+            } catch (error) {
+                console.error("Failed to fetch data:", error);
+            }
+        }
+
+        // Fetch immediately, then every 10 seconds
+        fetchData();
+        setInterval(fetchData, 10000);
     </script>
 </body>
 </html>
@@ -256,8 +319,23 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 func main() {
 	config := LoadConfig()
 
-	// Setup SSE Broker
-	broker := NewBroker()
+	// Initialize Database
+	log.Printf("Connecting to Database at %s...", config.DBURL)
+	db, err := initDB(config.DBURL)
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
+
+	// Initialize Data Cache (1 hour)
+	cacheDuration := 1 * time.Hour
+	cache := NewDataCache()
+	log.Printf("Loading last %v of data from database...", cacheDuration)
+	if err := loadCacheFromDB(db, cache, cacheDuration); err != nil {
+		log.Printf("Error loading cache from DB: %v", err)
+	} else {
+		log.Printf("Loaded %d data points into cache", len(cache.GetPoints()))
+	}
 
 	log.Printf("Connecting to RabbitMQ at %s...", config.RabbitMQURL)
 	conn, err := amqp.Dial(config.RabbitMQURL)
@@ -334,16 +412,45 @@ func main() {
 				continue
 			}
 
-			// Broadcast the JSON via SSE
-			broker.Notifier <- d.Body
+			// Insert into DB
+			if err := insertPayload(db, payload); err != nil {
+				log.Printf("Failed to insert payload into DB: %v", err)
+			}
 
-			log.Printf("Forwarded payload from device %s", payload.Device)
+			// Add to Cache
+			var p1, p2, p3, p4 *float64
+			for _, p := range payload.Data {
+				switch p.ID {
+				case 1:
+					p1 = p.T
+				case 2:
+					p2 = p.T
+				case 3:
+					p3 = p.T
+				case 4:
+					p4 = p.T
+				}
+			}
+			cache.AddAndEvict(CachedDataPoint{
+				TS:     payload.TS,
+				Device: payload.Device,
+				Probe1: p1,
+				Probe2: p2,
+				Probe3: p3,
+				Probe4: p4,
+			}, cacheDuration)
+
+			log.Printf("Processed payload from device %s at %d", payload.Device, payload.TS)
 		}
 	}()
 
 	// Setup HTTP server
 	http.HandleFunc("/", serveIndex)
-	http.Handle("/events", broker)
+	http.HandleFunc("/api/temps", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(cache.GetPoints())
+	})
 
 	log.Printf("Starting HTTP server on port %s...", config.Port)
 	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
