@@ -18,12 +18,6 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if config.RabbitMQQueue != "smoker_temps_queue" {
 		t.Errorf("Expected default RabbitMQQueue, got %s", config.RabbitMQQueue)
 	}
-	if config.RabbitMQExchange != "smoker_exchange" {
-		t.Errorf("Expected default RabbitMQExchange, got %s", config.RabbitMQExchange)
-	}
-	if config.RabbitMQRoutingKey != "smoker.temps" {
-		t.Errorf("Expected default RabbitMQRoutingKey, got %s", config.RabbitMQRoutingKey)
-	}
 	if config.Port != "8080" {
 		t.Errorf("Expected default Port, got %s", config.Port)
 	}
@@ -48,12 +42,6 @@ func TestLoadConfigEnvVars(t *testing.T) {
 	}
 	if config.RabbitMQQueue != "custom_queue" {
 		t.Errorf("Expected overridden RabbitMQQueue, got %s", config.RabbitMQQueue)
-	}
-	if config.RabbitMQExchange != "custom_exchange" {
-		t.Errorf("Expected overridden RabbitMQExchange, got %s", config.RabbitMQExchange)
-	}
-	if config.RabbitMQRoutingKey != "custom.key" {
-		t.Errorf("Expected overridden RabbitMQRoutingKey, got %s", config.RabbitMQRoutingKey)
 	}
 	if config.Port != "9090" {
 		t.Errorf("Expected overridden Port, got %s", config.Port)

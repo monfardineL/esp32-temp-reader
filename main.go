@@ -16,23 +16,19 @@ import (
 
 // Config holds the application configuration
 type Config struct {
-	RabbitMQURL        string
-	RabbitMQQueue      string
-	RabbitMQExchange   string
-	RabbitMQRoutingKey string
-	Port               string
-	DBURL              string
+	RabbitMQURL   string
+	RabbitMQQueue string
+	Port          string
+	DBURL         string
 }
 
 // LoadConfig loads configuration from environment variables
 func LoadConfig() *Config {
 	config := &Config{
-		RabbitMQURL:        os.Getenv("RABBITMQ_URL"),
-		RabbitMQQueue:      os.Getenv("RABBITMQ_QUEUE"),
-		RabbitMQExchange:   os.Getenv("RABBITMQ_EXCHANGE"),
-		RabbitMQRoutingKey: os.Getenv("RABBITMQ_ROUTING_KEY"),
-		Port:               os.Getenv("PORT"),
-		DBURL:              os.Getenv("DB_URL"),
+		RabbitMQURL:   os.Getenv("RABBITMQ_URL"),
+		RabbitMQQueue: os.Getenv("RABBITMQ_QUEUE"),
+		Port:          os.Getenv("PORT"),
+		DBURL:         os.Getenv("DB_URL"),
 	}
 
 	// Set defaults if not provided
@@ -41,12 +37,6 @@ func LoadConfig() *Config {
 	}
 	if config.RabbitMQQueue == "" {
 		config.RabbitMQQueue = "smoker_temps_queue"
-	}
-	if config.RabbitMQExchange == "" {
-		config.RabbitMQExchange = "smoker_exchange"
-	}
-	if config.RabbitMQRoutingKey == "" {
-		config.RabbitMQRoutingKey = "smoker.temps"
 	}
 	if config.Port == "" {
 		config.Port = "8080"
@@ -337,112 +327,8 @@ func main() {
 		log.Printf("Loaded %d data points into cache", len(cache.GetPoints()))
 	}
 
-	log.Printf("Connecting to RabbitMQ at %s...", config.RabbitMQURL)
-	conn, err := amqp.Dial(config.RabbitMQURL)
-	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
-	}
-	defer conn.Close()
-
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("Failed to open a channel: %v", err)
-	}
-	defer ch.Close()
-
-	// Declare Exchange
-	err = ch.ExchangeDeclare(
-		config.RabbitMQExchange, // name
-		"topic",                 // type
-		true,                    // durable
-		false,                   // auto-deleted
-		false,                   // internal
-		false,                   // no-wait
-		nil,                     // arguments
-	)
-	if err != nil {
-		log.Fatalf("Failed to declare an exchange: %v", err)
-	}
-
-	// Declare Queue
-	q, err := ch.QueueDeclare(
-		config.RabbitMQQueue, // name
-		true,                 // durable
-		false,                // delete when unused
-		false,                // exclusive
-		false,                // no-wait
-		nil,                  // arguments
-	)
-	if err != nil {
-		log.Fatalf("Failed to declare a queue: %v", err)
-	}
-
-	// Bind Queue
-	err = ch.QueueBind(
-		q.Name,                     // queue name
-		config.RabbitMQRoutingKey,  // routing key
-		config.RabbitMQExchange,    // exchange
-		false,
-		nil,
-	)
-	if err != nil {
-		log.Fatalf("Failed to bind a queue: %v", err)
-	}
-
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	if err != nil {
-		log.Fatalf("Failed to register a consumer: %v", err)
-	}
-
-	log.Printf("Waiting for messages on queue %s. To exit press CTRL+C", q.Name)
-
-	go func() {
-		for d := range msgs {
-			var payload SmokerPayload
-			if err := json.Unmarshal(d.Body, &payload); err != nil {
-				log.Printf("Error decoding JSON: %v", err)
-				continue
-			}
-
-			// Insert into DB
-			if err := insertPayload(db, payload); err != nil {
-				log.Printf("Failed to insert payload into DB: %v", err)
-			}
-
-			// Add to Cache
-			var p1, p2, p3, p4 *float64
-			for _, p := range payload.Data {
-				switch p.ID {
-				case 1:
-					p1 = p.T
-				case 2:
-					p2 = p.T
-				case 3:
-					p3 = p.T
-				case 4:
-					p4 = p.T
-				}
-			}
-			cache.AddAndEvict(CachedDataPoint{
-				TS:     payload.TS,
-				Device: payload.Device,
-				Probe1: p1,
-				Probe2: p2,
-				Probe3: p3,
-				Probe4: p4,
-			}, cacheDuration)
-
-			log.Printf("Processed payload from device %s at %d", payload.Device, payload.TS)
-		}
-	}()
+	// Start RabbitMQ worker in the background
+	go runRabbitMQWorker(config, db, cache, cacheDuration)
 
 	// Setup HTTP server
 	http.HandleFunc("/", serveIndex)
@@ -455,5 +341,106 @@ func main() {
 	log.Printf("Starting HTTP server on port %s...", config.Port)
 	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
 		log.Fatalf("Failed to start HTTP server: %v", err)
+	}
+}
+
+func runRabbitMQWorker(config *Config, db *sql.DB, cache *DataCache, cacheDuration time.Duration) {
+	for {
+		log.Printf("Connecting to RabbitMQ at %s...", config.RabbitMQURL)
+		conn, err := amqp.Dial(config.RabbitMQURL)
+		if err != nil {
+			log.Printf("Failed to connect to RabbitMQ: %v. Retrying in 10s...", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		ch, err := conn.Channel()
+		if err != nil {
+			log.Printf("Failed to open a channel: %v. Retrying in 10s...", err)
+			conn.Close()
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		// Declare Queue
+		q, err := ch.QueueDeclare(
+			config.RabbitMQQueue, true, false, false, false, nil,
+		)
+		if err != nil {
+			log.Printf("Failed to declare queue: %v. Retrying in 10s...", err)
+			ch.Close()
+			conn.Close()
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		msgs, err := ch.Consume(
+			q.Name, "", true, false, false, false, nil,
+		)
+		if err != nil {
+			log.Printf("Failed to register consumer: %v. Retrying in 10s...", err)
+			ch.Close()
+			conn.Close()
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		log.Printf("RabbitMQ Connected. Waiting for messages on queue %s.", q.Name)
+
+		// Monitor connection health
+		closeChan := conn.NotifyClose(make(chan *amqp.Error))
+
+		processLoop:
+		for {
+			select {
+			case err := <-closeChan:
+				if err != nil {
+					log.Printf("RabbitMQ connection closed: %v", err)
+				}
+				break processLoop
+			case d, ok := <-msgs:
+				if !ok {
+					log.Print("RabbitMQ message channel closed")
+					break processLoop
+				}
+
+				var payload SmokerPayload
+				if err := json.Unmarshal(d.Body, &payload); err != nil {
+					log.Printf("Error decoding JSON: %v", err)
+					continue
+				}
+
+				// Insert into DB
+				if err := insertPayload(db, payload); err != nil {
+					log.Printf("Failed to insert payload into DB: %v", err)
+				}
+
+				// Add to Cache
+				var p1, p2, p3, p4 *float64
+				for _, p := range payload.Data {
+					switch p.ID {
+					case 1: p1 = p.T
+					case 2: p2 = p.T
+					case 3: p3 = p.T
+					case 4: p4 = p.T
+					}
+				}
+				cache.AddAndEvict(CachedDataPoint{
+					TS:     payload.TS,
+					Device: payload.Device,
+					Probe1: p1,
+					Probe2: p2,
+					Probe3: p3,
+					Probe4: p4,
+				}, cacheDuration)
+
+				log.Printf("Processed payload from device %s at %d", payload.Device, payload.TS)
+			}
+		}
+
+		ch.Close()
+		conn.Close()
+		log.Print("RabbitMQ worker disconnected. Reconnecting in 10s...")
+		time.Sleep(10 * time.Second)
 	}
 }
